@@ -65,84 +65,84 @@ class VanillaTransformer(nn.Module):
             if param.dim() > 1:
                 nn.init.xavier_uniform_(param)
 
-
-class VanillaEncoderLayer(nn.Module):
-
-    def __init__(
-            self,
-            d_model: int,
-            nhead: int,
-            dim_feedforward: int,
-            dropout: float = 0.0,
-            activation: Union[str, Callable[[Tensor], Tensor]] = F.silu,
-
-    ):
-        
-
-
 class SelfAttention(nn.Module):
-    
+
     def __init__(
             self,
-            temperature,
-            attn_dropout: float = 0.1,
+            temperature: float = 0.1,
+            attn_dropout: float = 0.1
+
     ):
         super().__init__()
         self.temperature = temperature
-        self.dropout = attn_dropout
+        self.dropout = nn.Dropout(attn_dropout)
 
     def forward(
             self,
             q,
             k,
             v,
-            mask = None
-    ):  
-        d_k = k.size()[-1]
-        k = rearrange(k, 'b x y -> b y x')
-
+            mask = None   
+    ):
+        d_k = q.size(0)
+        k = rearrange(k, 'b n m d -> b n d m')
         attn = torch.matmul(q / self.temperature, k)
-        attn = attn / np.sqrt(d_k)
+        attn = torch.div(attn, np.sqrt(d_k))
         if mask is not None:
             attn = attn.masked_fill(mask == 0, -1e9)
         
         attn = F.softmax(attn, dim = -1)
         attn = self.dropout(attn)
         output = torch.matmul(attn, v)
-        return output, attn
+        return output 
+
+
 
 class MultiHeadAttention(nn.Module):
-
+    """
+    b: batch size
+    m: max_seq length
+    n: nheads
+    h: head_dim
+    """
     def __init__(
         self,
         d_model,
         nheads,
         dropout: float = 0.1,
+        attn_dropout: float = 0.1,
         bias = True,
 
     ):
-        self.dim_emb = d_model
+        super().__init__()
+        self.d_model = d_model
         self.nheads = nheads
-        self.dropout = dropout
-        self.head_dim = d_model // nheads
-        assert self.head_dim * nheads == self.dim_emb
+        self.dropout = nn.Dropout(dropout)
+        assert self.head_dim * nheads == self.d_model
 
         self.q = nn.Linear(d_model, d_model, bias = bias)
         self.k = nn.Linear(d_model, d_model, bias = bias)
         self.v = nn.Linear(d_model, d_model, bias = bias)
-        self.selfattn = SelfAttention()
+        self.selfattn = SelfAttention(
+            temperature = 0.1,
+            attn_dropout = attn_dropout
+        )
+        self.o = nn.Linear(d_model, d_model, bias = bias)
 
     def forward(
             self,
-            q,
-            k,
-            v,
-            mask = None
+            src,
+            src_mask = None
     ):
-        batch_size = q.size()[0]
-        q, k, v = rearrange(self.q(q), 'b d1 (h d2) -> b -1 h d2'), rearrange(self.q(k), 'b d1 (h d2) -> b -1 h d2'), rearrange(self.q(v), 'b d1 (h d2) -> b -1 h d2')
-        output = self.selfattn(q, k, v, mask = mask)
-        output = rearrange(output, 'b -1 h d2 -> b d1 (h d2)', b=batch_size, d2=self.nheads)
+        # MultiheadAttention
+        q = rearrange(self.q(src), 'b m (n h) -> b n m h', n = self.nheads)
+        k = rearrange(self.k(src), 'b m (n h) -> b n m h', n = self.nheads)
+        v = rearrange(self.k(src), 'b m (n h) -> b n m h', n = self.nheads)
+
+        output = self.selfattn(q, k, v, mask = src_mask)
+        output = rearrange(output, 'b n m h -> b m (n h)', n = self.nheads)
+        output = self.o(output)
+        output = self.dropout(output)
         return output
 
 class FeedForwardBlock(nn.Module):
@@ -175,3 +175,44 @@ class ResidualConnection(nn.Module):
 
     def forward(self, x, **kwargs):
         return self.layer(x, **kwargs) + x
+
+
+class VanillaEncoderLayer(nn.Module):
+    def __init__(self, 
+                 d_model, 
+                 nheads, 
+                 pf_dim,  
+                 dropout, 
+                 device):
+        super().__init__()
+        
+        self.self_attn_layer_norm = nn.LayerNorm(d_model)
+        self.ff_layer_norm = nn.LayerNorm(d_model)
+        self.self_attention = MultiHeadAttentionLayer(d_model, nheads, dropout, device)
+        self.positionwise_feedforward = PositionwiseFeedforwardLayer(d_model, 
+                                                                     pf_dim, 
+                                                                     dropout)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, src, src_mask):
+        
+        #src = [batch size, src len, hid dim]
+        #src_mask = [batch size, 1, 1, src len] 
+                
+        #self attention
+        _src, _ = self.self_attention(src, src, src, src_mask)
+        
+        #dropout, residual connection and layer norm
+        src = self.self_attn_layer_norm(src + self.dropout(_src))
+        
+        #src = [batch size, src len, hid dim]
+        
+        #positionwise feedforward
+        _src = self.positionwise_feedforward(src)
+        
+        #dropout, residual and layer norm
+        src = self.ff_layer_norm(src + self.dropout(_src))
+        
+        #src = [batch size, src len, hid dim]
+        
+        return src
