@@ -118,7 +118,7 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.nheads = nheads
         self.dropout = nn.Dropout(dropout)
-        assert self.head_dim * nheads == self.d_model
+        assert self.d_model % nheads == 0
 
         self.q = nn.Linear(d_model, d_model, bias = bias)
         self.k = nn.Linear(d_model, d_model, bias = bias)
@@ -151,7 +151,7 @@ class FeedForwardBlock(nn.Module):
         self,
         d_model: int,
         dim_feedforward: int,
-        activation: Union[str, Callable[[Tensor], Tensor]] = nn.SiLU(),
+        activation = nn.SiLU(),
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -176,43 +176,72 @@ class ResidualConnection(nn.Module):
     def forward(self, x, **kwargs):
         return self.layer(x, **kwargs) + x
 
+class PostNormalization(nn.Module):
+
+    def __init__(self, layer, d_model):
+        super().__init__()
+        self.layer = layer
+        self.d_model = d_model
+        self.layernorm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        return self.layernorm(self.layer(x))
+    
+class PreNormalization(nn.Module):
+
+    def __init__(self, layer, d_model):
+        super().__init__()
+        self.layer = layer
+        self.d_model = d_model
+        self.layernorm = nn.LayerNorm(d_model)
+
+    def forward(self, x, **kwargs):
+        return self.layer(self.layernorm(x), **kwargs)
 
 class VanillaEncoderLayer(nn.Module):
     def __init__(self, 
-                 d_model, 
-                 nheads, 
-                 pf_dim,  
-                 dropout, 
-                 device):
+            d_model, 
+            nheads, 
+            dim_feedforward,  
+            dropout,
+            attn_dropout 
+                 
+    ):
         super().__init__()
         
-        self.self_attn_layer_norm = nn.LayerNorm(d_model)
+        self.attn_layer_norm = nn.LayerNorm(d_model)
         self.ff_layer_norm = nn.LayerNorm(d_model)
-        self.self_attention = MultiHeadAttentionLayer(d_model, nheads, dropout, device)
-        self.positionwise_feedforward = PositionwiseFeedforwardLayer(d_model, 
-                                                                     pf_dim, 
-                                                                     dropout)
+        self.attn = PostNormalization(
+            ResidualConnection(
+                MultiHeadAttention(
+                d_model = d_model, 
+                nheads = nheads, 
+                dropout = dropout, 
+                attn_dropout = attn_dropout
+                )
+            ),
+            d_model = d_model
+        )
+        
+        
+        self.feedforward = PostNormalization(
+            ResidualConnection(
+                FeedForwardBlock(
+                d_model = d_model,
+                dim_feedforward = dim_feedforward,
+                dropout = dropout
+                )
+            ),
+            d_model = d_model
+        )
+
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, src, src_mask):
+    def forward(self, src, src_mask = None):
         
-        #src = [batch size, src len, hid dim]
-        #src_mask = [batch size, 1, 1, src len] 
-                
-        #self attention
-        _src, _ = self.self_attention(src, src, src, src_mask)
-        
-        #dropout, residual connection and layer norm
-        src = self.self_attn_layer_norm(src + self.dropout(_src))
-        
-        #src = [batch size, src len, hid dim]
-        
-        #positionwise feedforward
-        _src = self.positionwise_feedforward(src)
-        
-        #dropout, residual and layer norm
-        src = self.ff_layer_norm(src + self.dropout(_src))
-        
-        #src = [batch size, src len, hid dim]
+
+        #self attention & residual connection
+        output = self.attn(src, src_mask)
+        output = self.feedforward(output)
         
         return src
