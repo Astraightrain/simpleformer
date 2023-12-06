@@ -5,7 +5,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor, nn
-from torch.nn.parameter import Parameter
+
+from .common_layer import PostNormalization, ResidualConnection
 
 
 class VanillaTransformer(nn.Module):
@@ -19,10 +20,7 @@ class VanillaTransformer(nn.Module):
         dropout: float = 0.1,
         activation: Union[str, Callable[[Tensor], Tensor]] = F.silu,
         bias: bool = True,
-        device=None,
-        dtype=None,
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
         encoder_layer = VanillaEncoderLayer(
@@ -33,13 +31,14 @@ class VanillaTransformer(nn.Module):
             activation=activation,
             bias=bias,
         )
-        encoder_norm = nn.LayernNorm(d_model, **factory_kwargs)
+
         self.encoder = VanillaEncoder(
             encoder_layer=encoder_layer,
-            encoder_norm=encoder_norm,
             num_layers=num_encoder_layers,
             bias=bias,
         )
+
+        self.taskhead = VanillaHead(d_model)
 
     def forward(
         self,
@@ -47,19 +46,147 @@ class VanillaTransformer(nn.Module):
         target: Tensor,
         src_mask: Optional[Tensor] = None,
         target_mask: Optional[Tensor] = None,
-        memory_mask: Optional[Tensor] = None,
     ):
-        memory = self.encoder(src, mask=src_mask)
+        encoder_output = self.encoder(src, mask=src_mask)
         output = self.decoder(
-            target, memory, target_mask=target_mask, memory_mask=memory_mask
+            target, encoder_output, src_mask=src_mask, target_mask=target_mask
         )
-
+        output = self.taskhead(output)
         return output
 
     def _reset_parameters(self):
         for param in self.parameters():
             if param.dim() > 1:
                 nn.init.xavier_uniform_(param)
+
+
+class VanillaEncoder(nn.Module):
+    def __init__(
+        self,
+        encoder_layer,
+        num_layers: int,
+    ):
+        super().__init__()
+
+        self.encoder = nn.ModuleList([encoder_layer for _ in range(num_layers)])
+
+    def foward(self, x, src_mask=None):
+        for enc_layer in self.encoder:
+            x = enc_layer(x, src_mask=src_mask)
+
+        return x
+
+
+class VanillaEncoderLayer(nn.Module):
+    def __init__(self, d_model, nheads, dim_feedforward, dropout, attn_dropout):
+        super().__init__()
+
+        self.attn = PostNormalization(
+            ResidualConnection(
+                MultiHeadAttention(
+                    d_model=d_model,
+                    nheads=nheads,
+                    dropout=dropout,
+                    attn_dropout=attn_dropout,
+                )
+            ),
+            d_model=d_model,
+        )
+
+        self.feedforward = PostNormalization(
+            ResidualConnection(
+                FeedForwardBlock(
+                    d_model=d_model, dim_feedforward=dim_feedforward, dropout=dropout
+                )
+            ),
+            d_model=d_model,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src, src_mask=None):
+        # self attention & residual connection
+        output = self.attn(src, src_mask=src_mask)
+        output = self.feedforward(output)
+
+        return output
+
+
+class VanillaDecoder(nn.Module):
+    def __init__(
+        self,
+        decoder_layer,
+        num_layers: int,
+    ):
+        super().__init__()
+        self.decoder = nn.ModuleList([decoder_layer for _ in range(num_layers)])
+
+    def foward(self, target, encoder_output, src_mask=None, target_mask=None):
+        for dec_layer in self.decoder:
+            x = dec_layer(x, src_mask=target_mask)
+
+        return x
+
+
+class VanillaDecoderLayer(nn.Module):
+    def __init__(self, d_model, nheads, dim_feedforward, dropout, attn_dropout):
+        super().__init__()
+
+        self.attn = PostNormalization(
+            ResidualConnection(
+                MultiHeadAttention(
+                    d_model=d_model,
+                    nheads=nheads,
+                    dropout=dropout,
+                    attn_dropout=attn_dropout,
+                )
+            ),
+            d_model=d_model,
+        )
+
+        self.attn2 = PostNormalization(
+            ResidualConnection(
+                MultiHeadAttention(
+                    d_model=d_model,
+                    nheads=nheads,
+                    dropout=dropout,
+                    attn_dropout=attn_dropout,
+                )
+            ),
+            d_model=d_model,
+        )
+
+        self.feedforward = PostNormalization(
+            ResidualConnection(
+                FeedForwardBlock(
+                    d_model=d_model, dim_feedforward=dim_feedforward, dropout=dropout
+                )
+            ),
+            d_model=d_model,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, target, encoder_output, src_mask=None, target_mask=None):
+        # self attention & residual connection
+        output = self.attn1(target, src_mask=target_mask)
+        output = self.attn2(encoder_output + output, src_mask=src_mask)
+        output = self.feedforward(output)
+
+        return output
+
+
+class VanillaHead(nn.Module):
+    def __init__(self, d_model: int, activation=nn.SiLU()):
+        super().__init__()
+        self.layer = nn.Sequential(
+            nn.Linear(d_model, 1),
+            activation,
+            nn.Softmax(),
+        )
+
+    def forward(self, x):
+        return self.layer(x)
 
 
 class SelfAttention(nn.Module):
@@ -143,104 +270,3 @@ class FeedForwardBlock(nn.Module):
 
     def forward(self, x):
         return self.feedforward(x)
-
-
-class ResidualConnection(nn.Module):
-    def __init__(self, layer):
-        super().__init__()
-        self.layer = layer
-
-    def forward(self, x, **kwargs):
-        return self.layer(x, **kwargs) + x
-
-
-class PostNormalization(nn.Module):
-    def __init__(self, layer, d_model):
-        super().__init__()
-        self.layer = layer
-        self.d_model = d_model
-        self.layernorm = nn.LayerNorm(d_model)
-
-    def forward(self, x):
-        return self.layernorm(self.layer(x))
-
-
-class PreNormalization(nn.Module):
-    def __init__(self, layer, d_model):
-        super().__init__()
-        self.layer = layer
-        self.d_model = d_model
-        self.layernorm = nn.LayerNorm(d_model)
-
-    def forward(self, x, **kwargs):
-        return self.layer(self.layernorm(x), **kwargs)
-
-
-class VanillaEncoderLayer(nn.Module):
-    def __init__(self, d_model, nheads, dim_feedforward, dropout, attn_dropout):
-        super().__init__()
-
-        self.attn = PostNormalization(
-            ResidualConnection(
-                MultiHeadAttention(
-                    d_model=d_model,
-                    nheads=nheads,
-                    dropout=dropout,
-                    attn_dropout=attn_dropout,
-                )
-            ),
-            d_model=d_model,
-        )
-
-        self.feedforward = PostNormalization(
-            ResidualConnection(
-                FeedForwardBlock(
-                    d_model=d_model, dim_feedforward=dim_feedforward, dropout=dropout
-                )
-            ),
-            d_model=d_model,
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, src, src_mask=None):
-        # self attention & residual connection
-        output = self.attn(src, src_mask=src_mask)
-        output = self.feedforward(output)
-
-        return output
-
-
-class VanillaDecoderLayer(nn.Module):
-    def __init__(self, d_model, nheads, dim_feedforward, dropout, attn_dropout):
-        super().__init__()
-
-        self.attn = PostNormalization(
-            ResidualConnection(
-                MultiHeadAttention(
-                    d_model=d_model,
-                    nheads=nheads,
-                    dropout=dropout,
-                    attn_dropout=attn_dropout,
-                )
-            ),
-            d_model=d_model,
-        )
-
-        self.feedforward = PostNormalization(
-            ResidualConnection(
-                FeedForwardBlock(
-                    d_model=d_model, dim_feedforward=dim_feedforward, dropout=dropout
-                )
-            ),
-            d_model=d_model,
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, target, target_mask=None):
-        # self attention & residual connection
-        output = self.attn(target, src_mask=target_mask)
-        output = self.feedforward(output)
-
-        return output
