@@ -31,6 +31,26 @@ class PreNormalization(nn.Module):
     def forward(self, x, **kwargs):
         return self.layer(self.layernorm(x), **kwargs)
 
+class FeedForwardBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        dim_feedforward: int,
+        activation=nn.SiLU(),
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.feedforward = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            activation,
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.feedforward(x)
 
 class VanillaHead(nn.Module):
     def __init__(self, d_model: int, activation=nn.SiLU()):
